@@ -2249,9 +2249,10 @@ namespace plume {
 
     // MetalQueryPool
 
-    MetalQueryPool::MetalQueryPool(MetalDevice *device, uint32_t queryCount) {
+    MetalQueryPool::MetalQueryPool(MetalDevice *device, uint32_t queryCount, RenderQueryType queryType) {
         assert(device != nullptr);
         assert(queryCount > 0);
+        assert(queryType == RenderQueryType::TIMESTAMP && "Occlusion queries are not implemented in the Metal backend.");
 
         MetalAutoreleasePool releasePool;
         this->device = device;
@@ -2271,10 +2272,11 @@ namespace plume {
         sampleBuffer->release();
     }
 
-    void MetalQueryPool::queryResults() {
+    void MetalQueryPool::queryResults(uint32_t queryFirstIndex, uint32_t queryCount) {
         MetalAutoreleasePool releasePool;
-        const NS::Data* data = sampleBuffer->resolveCounterRange(NS::Range(0, results.size()));
-        std::memcpy(results.data(), data->mutableBytes(), results.size() * sizeof(uint64_t));
+        queryCount = std::min(queryCount, uint32_t(results.size()) - queryFirstIndex);
+        const NS::Data* data = sampleBuffer->resolveCounterRange(NS::Range(queryFirstIndex, queryCount));
+        std::memcpy(results.data() + queryFirstIndex, data->mutableBytes(), queryCount * sizeof(uint64_t));
     }
 
     const uint64_t *MetalQueryPool::getResults() const {
@@ -3297,6 +3299,18 @@ namespace plume {
         }
     }
 
+    void MetalCommandList::beginQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) {
+        assert(false && "Occlusion queries are not implemented in the Metal backend.");
+    }
+
+    void MetalCommandList::endQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) {
+        assert(false && "Occlusion queries are not implemented in the Metal backend.");
+    }
+
+    void MetalCommandList::resolveQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) {
+        assert(false && "Occlusion queries are not implemented in the Metal backend.");
+    }
+
     void MetalCommandList::endOtherEncoders(EncoderType type) {
         if (activeType == type) {
           // Early return for the most likely case.
@@ -4010,8 +4024,8 @@ namespace plume {
         return std::make_unique<MetalFramebuffer>(this, desc);
     }
 
-    std::unique_ptr<RenderQueryPool> MetalDevice::createQueryPool(uint32_t queryCount) {
-        return std::make_unique<MetalQueryPool>(this, queryCount);
+    std::unique_ptr<RenderQueryPool> MetalDevice::createQueryPool(uint32_t queryCount, RenderQueryType queryType) {
+        return std::make_unique<MetalQueryPool>(this, queryCount, queryType);
     }
 
     void MetalDevice::setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) {

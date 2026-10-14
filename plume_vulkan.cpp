@@ -2679,15 +2679,16 @@ namespace plume {
 
     // VulkanQueryPool
 
-    VulkanQueryPool::VulkanQueryPool(VulkanDevice *device, uint32_t queryCount) {
+    VulkanQueryPool::VulkanQueryPool(VulkanDevice *device, uint32_t queryCount, RenderQueryType queryType) {
         assert(device != nullptr);
         assert(queryCount > 0);
 
         this->device = device;
+        this->queryType = queryType;
 
         VkQueryPoolCreateInfo createInfo = {};
         createInfo.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-        createInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        createInfo.queryType = (queryType == RenderQueryType::OCCLUSION) ? VK_QUERY_TYPE_OCCLUSION : VK_QUERY_TYPE_TIMESTAMP;
         createInfo.queryCount = queryCount;
         
         VkResult res = vkCreateQueryPool(device->vk, &createInfo, nullptr, &vk);
@@ -2703,10 +2704,19 @@ namespace plume {
         vkDestroyQueryPool(device->vk, vk, nullptr);
     }
 
-    void VulkanQueryPool::queryResults() {
-	    VkResult res = vkGetQueryPoolResults(device->vk, vk, 0, uint32_t(results.size()), sizeof(uint64_t) * results.size(), results.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+    void VulkanQueryPool::queryResults(uint32_t queryFirstIndex, uint32_t queryCount) {
+        queryCount = std::min(queryCount, uint32_t(results.size()) - queryFirstIndex);
+        if (queryCount == 0) {
+            return;
+        }
+
+	    VkResult res = vkGetQueryPoolResults(device->vk, vk, queryFirstIndex, queryCount, sizeof(uint64_t) * queryCount, results.data() + queryFirstIndex, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkGetQueryPoolResults failed with error code 0x%X.\n", res);
+            return;
+        }
+
+        if (queryType != RenderQueryType::TIMESTAMP) {
             return;
         }
 
@@ -2735,7 +2745,8 @@ namespace plume {
         constexpr uint64_t shift_bits = 16;
         double timestampPeriod = double(device->physicalDeviceProperties.limits.timestampPeriod);
         uint64_t h = 0, l = 0;
-        for (uint64_t &result : results) {
+        for (uint32_t i = 0; i < queryCount; i++) {
+            uint64_t &result = results[queryFirstIndex + i];
             mult64to128(result, uint64_t(timestampPeriod * double(1 << shift_bits)), h, l);
             result = l;
             result >>= shift_bits;
@@ -3464,6 +3475,27 @@ namespace plume {
 
         const VulkanQueryPool *interfaceQueryPool = static_cast<const VulkanQueryPool *>(queryPool);
         vkCmdWriteTimestamp(vk, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, interfaceQueryPool->vk, queryIndex);
+    }
+
+    void VulkanCommandList::beginQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) {
+        assert(queryPool != nullptr);
+
+        const VulkanQueryPool *interfaceQueryPool = static_cast<const VulkanQueryPool *>(queryPool);
+        assert(interfaceQueryPool->queryType == RenderQueryType::OCCLUSION);
+        checkActiveRenderPass();
+        vkCmdBeginQuery(vk, interfaceQueryPool->vk, queryIndex, 0);
+    }
+
+    void VulkanCommandList::endQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) {
+        assert(queryPool != nullptr);
+
+        const VulkanQueryPool *interfaceQueryPool = static_cast<const VulkanQueryPool *>(queryPool);
+        assert(interfaceQueryPool->queryType == RenderQueryType::OCCLUSION);
+        vkCmdEndQuery(vk, interfaceQueryPool->vk, queryIndex);
+    }
+
+    void VulkanCommandList::resolveQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) {
+        // No-op: Vulkan reads occlusion results straight out of the pool.
     }
 
     void VulkanCommandList::checkActiveRenderPass() {
@@ -4220,8 +4252,8 @@ namespace plume {
         return std::make_unique<VulkanFramebuffer>(this, desc);
     }
 
-    std::unique_ptr<RenderQueryPool> VulkanDevice::createQueryPool(uint32_t queryCount) {
-        return std::make_unique<VulkanQueryPool>(this, queryCount);
+    std::unique_ptr<RenderQueryPool> VulkanDevice::createQueryPool(uint32_t queryCount, RenderQueryType queryType) {
+        return std::make_unique<VulkanQueryPool>(this, queryCount, queryType);
     }
 
     void VulkanDevice::setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) {

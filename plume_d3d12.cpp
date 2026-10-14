@@ -7,9 +7,14 @@
 
 #include "plume_d3d12.h"
 
+#include <algorithm>
 #include <unordered_set>
 
 #include <dxgi1_5.h>
+
+#ifdef REXGLUE_ENABLE_PROFILING
+#include <tracy/Tracy.hpp>
+#endif
 
 #ifdef __clang__
 #pragma clang diagnostic push
@@ -140,6 +145,10 @@ namespace plume {
             return DXGI_FORMAT_R32_TYPELESS;
         case RenderFormat::D32_FLOAT:
             return DXGI_FORMAT_D32_FLOAT;
+        case RenderFormat::D24_UNORM_S8_UINT:
+            // Use a typeless resource so both depth-stencil and shader resource
+            // views can be created for the same texture.
+            return DXGI_FORMAT_R24G8_TYPELESS;
         case RenderFormat::D32_FLOAT_S8_UINT:
             // In order to be able to create both depth-stencil and shader resource views,
             // we must use R32G8X24_TYPELESS as the base type and specialize later.
@@ -243,6 +252,9 @@ namespace plume {
             // Specialize into depth view of depth-stencil texture.
             return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
         }
+        if (dxgiFormat == DXGI_FORMAT_R24G8_TYPELESS) {
+            return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        }
         return dxgiFormat;
     }
 
@@ -251,6 +263,9 @@ namespace plume {
         if (dxgiFormat == DXGI_FORMAT_R32G8X24_TYPELESS) {
             // Specialize into full depth-stencil view.
             return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+        }
+        if (dxgiFormat == DXGI_FORMAT_R24G8_TYPELESS) {
+            return DXGI_FORMAT_D24_UNORM_S8_UINT;
         }
         return dxgiFormat;
     }
@@ -1414,8 +1429,10 @@ namespace plume {
         }
 
         for (uint32_t i = 0; i < desc.textureCount; i++) {
-            textures[i].d3d->Release();
-            textures[i].d3d = nullptr;
+            if (textures[i].d3d != nullptr) {
+                textures[i].d3d->Release();
+                textures[i].d3d = nullptr;
+            }
         }
 
         HRESULT res = d3d->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, swapChainFlags);
@@ -1775,14 +1792,15 @@ namespace plume {
 
     // D3D12QueryPool
 
-    D3D12QueryPool::D3D12QueryPool(D3D12Device *device, uint32_t queryCount) {
+    D3D12QueryPool::D3D12QueryPool(D3D12Device *device, uint32_t queryCount, RenderQueryType queryType) {
         assert(device != nullptr);
         assert(queryCount > 0);
 
         this->device = device;
+        this->queryType = queryType;
 
         D3D12_QUERY_HEAP_DESC queryHeapDesc = {};
-        queryHeapDesc.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
+        queryHeapDesc.Type = (queryType == RenderQueryType::OCCLUSION) ? D3D12_QUERY_HEAP_TYPE_OCCLUSION : D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
         queryHeapDesc.Count = queryCount;
 
         HRESULT res = device->d3d->CreateQueryHeap(&queryHeapDesc, IID_PPV_ARGS(&d3d));
@@ -1801,13 +1819,17 @@ namespace plume {
         }
     }
 
-    void D3D12QueryPool::queryResults() {
+    void D3D12QueryPool::queryResults(uint32_t queryFirstIndex, uint32_t queryCount) {
+        queryCount = std::min(queryCount, uint32_t(results.size()) - queryFirstIndex);
         void *readbackData = readbackBuffer->map();
-        memcpy(results.data(), readbackData, sizeof(uint64_t) * results.size());
+        memcpy(results.data() + queryFirstIndex, static_cast<const uint8_t *>(readbackData) + sizeof(uint64_t) * queryFirstIndex, sizeof(uint64_t) * queryCount);
         readbackBuffer->unmap();
 
-        for (uint64_t &result : results) {
-            result = uint64_t(double(result) / double(device->timestampFrequency) * 1000000000.0);
+        if (queryType == RenderQueryType::TIMESTAMP) {
+            for (uint32_t i = 0; i < queryCount; i++) {
+                uint64_t &result = results[queryFirstIndex + i];
+                result = uint64_t(double(result) / double(device->timestampFrequency) * 1000000000.0);
+            }
         }
     }
 
@@ -2045,6 +2067,9 @@ namespace plume {
         }
         case D3D12Pipeline::Type::Graphics: {
             const D3D12GraphicsPipeline *graphicsPipeline = static_cast<const D3D12GraphicsPipeline *>(interfacePipeline);
+            if (graphicsPipeline->d3d == nullptr) {
+                return;
+            }
             d3d->SetPipelineState(graphicsPipeline->d3d);
             activeGraphicsPipeline = graphicsPipeline;
             break;
@@ -2262,7 +2287,7 @@ namespace plume {
             }
         }
 
-        d3d->ClearRenderTargetView(targetFramebuffer->colorHandles[attachmentIndex], colorValue.rgba, clearRectsCount, (clearRectsCount > 0) ? rectVector.data() : nullptr);
+            d3d->ClearRenderTargetView(targetFramebuffer->colorHandles[attachmentIndex], colorValue.rgba, clearRectsCount, (clearRectsCount > 0) ? rectVector.data() : nullptr);
     }
 
     void D3D12CommandList::clearDepthStencil(bool clearDepth, bool clearStencil, float depthValue, uint32_t stencilValue, const RenderRect *clearRects, uint32_t clearRectsCount) {
@@ -2287,7 +2312,7 @@ namespace plume {
         if (clearStencil) {
             clearFlags |= D3D12_CLEAR_FLAG_STENCIL;
         }
-        d3d->ClearDepthStencilView(targetFramebuffer->depthHandle, clearFlags, depthValue, stencilValue, clearRectsCount, (clearRectsCount > 0) ? rectVector.data() : nullptr);
+         d3d->ClearDepthStencilView(targetFramebuffer->depthHandle, clearFlags, depthValue, stencilValue, clearRectsCount, (clearRectsCount > 0) ? rectVector.data() : nullptr);
     }
 
     void D3D12CommandList::copyBufferRegion(RenderBufferReference dstBuffer, RenderBufferReference srcBuffer, uint64_t size) {
@@ -2434,6 +2459,31 @@ namespace plume {
         const D3D12Buffer *readbackBuffer = static_cast<const D3D12Buffer *>(interfaceQueryPool->readbackBuffer.get());
         d3d->EndQuery(interfaceQueryPool->d3d, D3D12_QUERY_TYPE_TIMESTAMP, queryIndex);
         d3d->ResolveQueryData(interfaceQueryPool->d3d, D3D12_QUERY_TYPE_TIMESTAMP, queryIndex, 1, readbackBuffer->d3d, queryIndex * sizeof(uint64_t));
+    }
+
+    void D3D12CommandList::beginQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) {
+        assert(queryPool != nullptr);
+
+        const D3D12QueryPool *interfaceQueryPool = static_cast<const D3D12QueryPool *>(queryPool);
+        assert(interfaceQueryPool->queryType == RenderQueryType::OCCLUSION);
+        d3d->BeginQuery(interfaceQueryPool->d3d, D3D12_QUERY_TYPE_OCCLUSION, queryIndex);
+    }
+
+    void D3D12CommandList::endQuery(const RenderQueryPool *queryPool, uint32_t queryIndex) {
+        assert(queryPool != nullptr);
+
+        const D3D12QueryPool *interfaceQueryPool = static_cast<const D3D12QueryPool *>(queryPool);
+        assert(interfaceQueryPool->queryType == RenderQueryType::OCCLUSION);
+        d3d->EndQuery(interfaceQueryPool->d3d, D3D12_QUERY_TYPE_OCCLUSION, queryIndex);
+    }
+
+    void D3D12CommandList::resolveQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) {
+        assert(queryPool != nullptr);
+
+        const D3D12QueryPool *interfaceQueryPool = static_cast<const D3D12QueryPool *>(queryPool);
+        assert(interfaceQueryPool->queryType == RenderQueryType::OCCLUSION);
+        const D3D12Buffer *readbackBuffer = static_cast<const D3D12Buffer *>(interfaceQueryPool->readbackBuffer.get());
+        d3d->ResolveQueryData(interfaceQueryPool->d3d, D3D12_QUERY_TYPE_OCCLUSION, queryFirstIndex, queryCount, readbackBuffer->d3d, queryFirstIndex * sizeof(uint64_t));
     }
 
     void D3D12CommandList::checkDescriptorHeaps() {
@@ -2677,6 +2727,10 @@ namespace plume {
     }
 
     void D3D12CommandQueue::executeCommandLists(const RenderCommandList **commandLists, uint32_t commandListCount, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount, RenderCommandSemaphore **signalSemaphores, uint32_t signalSemaphoreCount, RenderCommandFence *signalFence) {
+#ifdef REXGLUE_ENABLE_PROFILING
+        ZoneNamedN(___tracy_plume_execute_command_lists, "plume/d3d12/execute_command_lists", true);
+#endif
+
         assert(commandLists != nullptr);
         assert(commandListCount > 0);
 
@@ -2762,7 +2816,11 @@ namespace plume {
 
         HRESULT res = device->allocator->CreateResource(&allocationDesc, &resourceDesc, resourceStates, nullptr, &allocation, IID_PPV_ARGS(&d3d));
         if (FAILED(res)) {
-            fprintf(stderr, "CreateResource failed with error code 0x%lX.\n", res);
+            fprintf(stderr, "CreateResource failed with error code 0x%lX (buffer size %llu, heapType %u).\n", res, (unsigned long long)(resourceDesc.Width), (unsigned)desc.heapType);
+            if (res == DXGI_ERROR_DEVICE_REMOVED || res == DXGI_ERROR_DEVICE_RESET) {
+                HRESULT removedReason = device->d3d->GetDeviceRemovedReason();
+                fprintf(stderr, "Device removed/reset. GetDeviceRemovedReason() = 0x%lX.\n", removedReason);
+            }
             return;
         }
     }
@@ -2775,6 +2833,11 @@ namespace plume {
     }
 
     void *D3D12Buffer::map(uint32_t subresource, const RenderRange *readRange) {
+        if (d3d == nullptr) {
+            fprintf(stderr, "D3D12Buffer::map called on a buffer whose resource failed to create.\n");
+            return nullptr;
+        }
+
         D3D12_RANGE range;
         if (readRange != nullptr) {
             range.Begin = readRange->begin;
@@ -2787,6 +2850,10 @@ namespace plume {
     }
 
     void D3D12Buffer::unmap(uint32_t subresource, const RenderRange *writtenRange) {
+        if (d3d == nullptr) {
+            return;
+        }
+
         D3D12_RANGE range;
         if (writtenRange != nullptr) {
             range.Begin = writtenRange->begin;
@@ -3134,6 +3201,11 @@ namespace plume {
         psoDesc.DepthStencilState.StencilEnable = desc.stencilEnabled;
         psoDesc.DepthStencilState.StencilReadMask = desc.stencilReadMask;
         psoDesc.DepthStencilState.StencilWriteMask = desc.stencilWriteMask;
+        // The stencil reference is PSO-static in this interface; the command
+        // list applies it via OMSetStencilRef from graphicsPipeline->stencilRef
+        // (see checkStencilRef). Without this it stayed 0 and desc.stencilReference
+        // was silently ignored.
+        stencilRef = desc.stencilReference;
         psoDesc.DepthStencilState.FrontFace.StencilFailOp = toD3D12(desc.stencilFrontFace.failOp);
         psoDesc.DepthStencilState.FrontFace.StencilDepthFailOp = toD3D12(desc.stencilFrontFace.depthFailOp);
         psoDesc.DepthStencilState.FrontFace.StencilPassOp = toD3D12(desc.stencilFrontFace.passOp);
@@ -3199,7 +3271,26 @@ namespace plume {
 
         psoDesc.InputLayout = { inputElements.data(), UINT(inputElements.size()) };
 
-        device->d3d->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&d3d));
+        HRESULT pipelineRes = device->d3d->CreateGraphicsPipelineState(&psoDesc, IID_PPV_ARGS(&d3d));
+        if (FAILED(pipelineRes) || d3d == nullptr) {
+            FILE *psoLog = fopen("pso_errors.log", "a");
+            if (psoLog != nullptr) {
+                fprintf(psoLog,
+                    "CreateGraphicsPipelineState FAILED hr=0x%08lX vsSize=%zu psSize=%zu gsSize=%zu "
+                    "rtCount=%u rtFormat=%d dsFormat=%d sampleCount=%u inputElems=%u topoType=%d "
+                    "cull=%d blend=%d depthEnable=%d\n",
+                    static_cast<unsigned long>(pipelineRes),
+                    psoDesc.VS.BytecodeLength, psoDesc.PS.BytecodeLength, psoDesc.GS.BytecodeLength,
+                    psoDesc.NumRenderTargets, int(psoDesc.RTVFormats[0]), int(psoDesc.DSVFormat),
+                    psoDesc.SampleDesc.Count, UINT(inputElements.size()),
+                    int(psoDesc.PrimitiveTopologyType),
+                    int(psoDesc.RasterizerState.CullMode),
+                    int(psoDesc.BlendState.RenderTarget[0].BlendEnable),
+                    int(psoDesc.DepthStencilState.DepthEnable));
+                fflush(psoLog);
+                fclose(psoLog);
+            }
+        }
     }
 
     D3D12GraphicsPipeline::~D3D12GraphicsPipeline() {
@@ -3910,7 +4001,11 @@ namespace plume {
     }
 
     std::unique_ptr<RenderPipeline> D3D12Device::createGraphicsPipeline(const RenderGraphicsPipelineDesc &desc) {
-        return std::make_unique<D3D12GraphicsPipeline>(this, desc);
+        auto pipeline = std::make_unique<D3D12GraphicsPipeline>(this, desc);
+        if (pipeline->d3d == nullptr) {
+            return nullptr;
+        }
+        return pipeline;
     }
 
     std::unique_ptr<RenderPipeline> D3D12Device::createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) {
@@ -3958,8 +4053,8 @@ namespace plume {
         return std::make_unique<D3D12Framebuffer>(this, desc);
     }
 
-    std::unique_ptr<RenderQueryPool> D3D12Device::createQueryPool(uint32_t queryCount) {
-        return std::make_unique<D3D12QueryPool>(this, queryCount);
+    std::unique_ptr<RenderQueryPool> D3D12Device::createQueryPool(uint32_t queryCount, RenderQueryType queryType) {
+        return std::make_unique<D3D12QueryPool>(this, queryCount, queryType);
     }
 
     void D3D12Device::setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) {

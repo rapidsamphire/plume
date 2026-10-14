@@ -87,6 +87,11 @@ if(WIN32)
     target_include_directories(plume PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/contrib/D3D12MemoryAllocator/include
     )
+    target_compile_definitions(plume PRIVATE
+        D3D12_DEBUG_LAYER_ENABLED
+        D3D12_DEBUG_LAYER_BREAK_ON_ERROR=false
+        D3D12_DEBUG_LAYER_BREAK_ON_WARNING=false
+    )
 endif()
 
 if(PLUME_SDL_VULKAN_ENABLED)

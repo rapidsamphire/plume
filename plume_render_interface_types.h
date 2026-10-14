@@ -118,6 +118,7 @@ namespace plume {
         R16G16_SINT,
         R32_TYPELESS,
         D32_FLOAT,
+        D24_UNORM_S8_UINT,
         D32_FLOAT_S8_UINT,
         R32_FLOAT,
         R32_UINT,
@@ -183,6 +184,11 @@ namespace plume {
         DIRECT,
         COMPUTE,
         COPY
+    };
+
+    enum class RenderQueryType {
+        TIMESTAMP,
+        OCCLUSION
     };
 
     enum class RenderPrimitiveTopology {
@@ -548,6 +554,7 @@ namespace plume {
         case RenderFormat::R16G16_SINT:
         case RenderFormat::R32_TYPELESS:
         case RenderFormat::D32_FLOAT:
+        case RenderFormat::D24_UNORM_S8_UINT:
         case RenderFormat::R32_FLOAT:
         case RenderFormat::R32_UINT:
         case RenderFormat::R32_SINT:
@@ -631,6 +638,7 @@ namespace plume {
         case RenderFormat::R16G16_SINT:
         case RenderFormat::R32_TYPELESS:
         case RenderFormat::D32_FLOAT:
+        case RenderFormat::D24_UNORM_S8_UINT:
         case RenderFormat::D32_FLOAT_S8_UINT:
         case RenderFormat::R32_FLOAT:
         case RenderFormat::R32_UINT:
@@ -685,6 +693,7 @@ namespace plume {
         switch (format) {
         case RenderFormat::D16_UNORM:
         case RenderFormat::D32_FLOAT:
+        case RenderFormat::D24_UNORM_S8_UINT:
         case RenderFormat::D32_FLOAT_S8_UINT:
             return true;
         default:
@@ -693,7 +702,7 @@ namespace plume {
     }
 
     constexpr bool RenderFormatIsStencil(RenderFormat format) {
-        return format == RenderFormat::D32_FLOAT_S8_UINT;
+        return format == RenderFormat::D24_UNORM_S8_UINT || format == RenderFormat::D32_FLOAT_S8_UINT;
     }
 
     constexpr RenderTextureViewDimension RenderTextureDimensionToView(const RenderTextureDimension dimension) {
